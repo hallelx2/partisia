@@ -84,6 +84,8 @@ impl VotingContract {
     }
 }
 
+
+// At this point we begin to initialise the build objects from the structs and 
 fn main() {
     let candidates = vec![
         Candidate { name: "Candidate A".to_string(), votes: 0 },
@@ -100,4 +102,5 @@ fn main() {
     contract.register_voter(RegisteredVoter {
         name: "Jane Doe".to_string(),
         age: 30,
-        location:
+        location: "EligibleRegion".to_string(),
+    });
