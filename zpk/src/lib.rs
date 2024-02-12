@@ -1,191 +1,145 @@
-//! Simple secret sum contract.
-//!
-//! Calculates the sum of secret inputs from multiple parties. The inputs are not revealed.
-//!
-//! This implementation works in following steps:
-//!
-//! 1. Initialization on the blockchain.
-//! 2. Receival of multiple secret inputs, using the real zk protocol.
-//! 3. The contract owner can start the ZK computation.
-//! 4. The Zk computation sums all the given inputs.
-//! 5. Once the zk computation is complete, the contract will publicize the summed variable.
-//! 6. Once the summed variable is public, the contract will also store it in the state,
-//!     such that the value can be read by all.
-//!
-
-#![allow(unused_variables)]
-
 #[macro_use]
 extern crate pbc_contract_codegen;
 extern crate pbc_contract_common;
-extern crate pbc_lib;
 
+use create_type_spec_derive::CreateTypeSpec;
 use pbc_contract_common::address::Address;
 use pbc_contract_common::context::ContractContext;
 use pbc_contract_common::events::EventGroup;
 use pbc_contract_common::zk::{CalculationStatus, SecretVarId, ZkInputDef, ZkState, ZkStateChange};
-use read_write_rpc_derive::ReadWriteRPC;
+use pbc_zk::Sbi32;
 use read_write_state_derive::ReadWriteState;
 
-/// Secret variable metadata. Unused for this contract, so we use a zero-sized struct to save space.
-#[derive(ReadWriteState, ReadWriteRPC, Debug)]
-struct SecretVarMetadata {}
+mod zk_compute;
 
-/// The maximum size of MPC variables.
-const BITLENGTH_OF_SECRET_VARIABLES: u32 = 32;
-
-/// The contract's state
-///
-/// ### Fields:
-///
-/// * `administrator`: [`Address`], the administrator of the contract.
-///
-/// * `sum_result`: [`Option<u32>`], place for storing the final result of the zk computation.
-#[state]
-struct ContractState {
-    /// Address allowed to start computation
-    administrator: Address,
-    /// Will contain the result (sum) when computation is complete
-    sum_result: Option<u32>,
+/// Secret variable metadata. Indicates if the variable is a vote or the number of counted yes votes
+#[derive(ReadWriteState, Debug)]
+#[repr(C)]
+struct SecretVarMetadata {
+    variable_type: SecretVarType,
 }
 
-/// Initializes the contract and bootstrab the contract state.
+#[derive(ReadWriteState, Debug, PartialEq)]
+#[repr(u8)]
+enum SecretVarType {
+    Vote = 1,
+    CountedYesVotes = 2,
+}
+
+#[derive(ReadWriteState, CreateTypeSpec, Clone)]
+struct VoteResult {
+    votes_for: u32,
+    votes_against: u32,
+    passed: bool,
+}
+
+/// This contract's state
+#[state]
+struct ContractState {
+    /// Address that deployed the contract
+    owner: Address,
+    /// When the voting stops; at this point all inputs must have been made, and vote counting can
+    /// now begin.
+    /// Represented as milliseconds since the epoch.
+    deadline_voting_time: i64,
+    /// A tally that holds the number of votes for, the number of votes against,
+    /// and a bool indicating whether the vote passed. It is initialized as None and is
+    /// eventually updated to Some(VoteResult) after start_vote_counting is called
+    vote_result: Option<VoteResult>,
+}
+
+/// Initializes contract
 ///
-/// ### Parameters:
-///
-/// * `ctx`: [`ContractContext`], initial context.
-///
-/// * `zk_state`: [`ZkState<SecretVarMetadata>`], initial zk state.
-///
-/// ### Returns
-///
-/// The new state object of type [`ContractState`] with the administrator set to the
-/// caller of this function.
-#[init]
-fn initialize(ctx: ContractContext, zk_state: ZkState<SecretVarMetadata>) -> ContractState {
+/// # Arguments
+/// * `voting_duration_ms` number of milliseconds from contract initialization where voting is
+/// open
+#[init(zk = true)]
+fn initialize(
+    ctx: ContractContext,
+    _zk_state: ZkState<SecretVarMetadata>,
+    voting_duration_ms: u32,
+) -> ContractState {
+    let deadline_voting_time = ctx.block_production_time + (voting_duration_ms as i64);
     ContractState {
-        administrator: ctx.sender,
-        sum_result: None,
+        owner: ctx.sender,
+        deadline_voting_time,
+        vote_result: None,
     }
 }
 
-/// Adds another secret input of size [`BITLENGTH_OF_SECRET_VARIABLES`].
-///
-/// ### Parameters:
-///
-/// * `ctx`: [`ContractContext`], the context of the current call.
-///
-/// * `state`: [`ContractState`], the current state of the contract.
-///
-/// * `zk_state`: [`ZkState<SecretVarMetadata>`], the current zk state.
-///
-/// ### Returns
-///
-/// The unchanged state, and a ZkInputDef defining the input size.
+/// Adds another vote.
 #[zk_on_secret_input(shortname = 0x40)]
-fn add_input(
+fn add_vote(
     context: ContractContext,
     state: ContractState,
     zk_state: ZkState<SecretVarMetadata>,
 ) -> (
     ContractState,
     Vec<EventGroup>,
-    ZkInputDef<SecretVarMetadata>,
+    ZkInputDef<SecretVarMetadata, Sbi32>,
 ) {
-    let input_def = ZkInputDef {
-        seal: false,
-        metadata: SecretVarMetadata {},
-        expected_bit_lengths: vec![BITLENGTH_OF_SECRET_VARIABLES],
-    };
+    assert!(
+        context.block_production_time < state.deadline_voting_time,
+        "Not allowed to vote after the deadline at {} ms UTC, current time is {} ms UTC",
+        state.deadline_voting_time,
+        context.block_production_time,
+    );
+    assert!(
+        zk_state
+            .secret_variables
+            .iter()
+            .chain(zk_state.pending_inputs.iter())
+            .all(|(_, v)| v.owner != context.sender),
+        "Each voter is only allowed to send one vote variable. Sender: {:?}",
+        context.sender
+    );
+    let input_def = ZkInputDef::with_metadata(SecretVarMetadata {
+        variable_type: SecretVarType::Vote,
+    });
     (state, vec![], input_def)
 }
 
-/// Automatically called when a variable is confirmed on chain.
+/// Allows anybody to start the computation of the vote.
 ///
-/// Unused for this contract, so we do nothing.
+/// The vote computation is automatic beyond this call, involving several steps, as described in the module documentation.
 ///
-/// ### Parameters:
-///
-/// * `ctx`: [`ContractContext`], the context of the current call.
-///
-/// * `state`: [`ContractState`], the current state of the contract.
-///
-/// * `zk_state`: [`ZkState<SecretVarMetadata>`], the current zk state.
-///
-/// * `inputted_variable`: [`SecretVarId`], the id of the inputted secret variable.
-///
-/// ### Returns
-/// The unchanged contract state.
-#[zk_on_variable_inputted]
-fn inputted_variable(
-    context: ContractContext,
-    state: ContractState,
-    zk_state: ZkState<SecretVarMetadata>,
-    inputted_variable: SecretVarId,
-) -> ContractState {
-    state
-}
-
-/// Start the zk-computation computing the sum of the secret variables. Only callable by the
-/// administrator.
-///
-/// ### Parameters:
-///
-/// * `ctx`: [`ContractContext`], the context of the current call.
-///
-/// * `state`: [`ContractState`], the current state of the contract.
-///
-/// * `zk_state`: [`ZkState<SecretVarMetadata>`], the current zk state.
-///
-/// ### Returns
-///
-/// The unchanged state, and a ZkStateChange denoting that the zk-computation should start.
-#[action(shortname = 0x01)]
-fn compute_sum(
+/// NOTE: This ignores any pending inputs
+#[action(shortname = 0x01, zk = true)]
+fn start_vote_counting(
     context: ContractContext,
     state: ContractState,
     zk_state: ZkState<SecretVarMetadata>,
 ) -> (ContractState, Vec<EventGroup>, Vec<ZkStateChange>) {
-    assert_eq!(
-        context.sender, state.administrator,
-        "Only administrator can start computation"
+    assert!(
+        context.block_production_time >= state.deadline_voting_time,
+        "Vote counting cannot start before specified starting time {} ms UTC, current time is {} ms UTC",
+        state.deadline_voting_time,
+        context.block_production_time,
     );
     assert_eq!(
         zk_state.calculation_state,
         CalculationStatus::Waiting,
-        "Computation must start from Waiting state, but was {:?}",
+        "Vote counting must start from Waiting state, but was {:?}",
         zk_state.calculation_state,
     );
 
     (
         state,
         vec![],
-        vec![ZkStateChange::start_computation(vec![SecretVarMetadata {}])],
+        vec![zk_compute::count_yes_votes_start(&SecretVarMetadata {
+            variable_type: SecretVarType::CountedYesVotes,
+        })],
     )
 }
 
 /// Automatically called when the computation is completed
 ///
 /// The only thing we do is to instantly open/declassify the output variables.
-///
-/// ### Parameters:
-///
-/// * `ctx`: [`ContractContext`], the context of the current call.
-///
-/// * `state`: [`ContractState`], the current state of the contract.
-///
-/// * `zk_state`: [`ZkState<SecretVarMetadata>`], the current zk state.
-///
-/// * `output_variables`: [`Vec<SecretVarId>`], the id's of the output variables.
-///
-/// ### Returns
-///
-/// The unchanged state, and a ZkStateChange opening the output variables.
 #[zk_on_compute_complete]
-fn sum_compute_complete(
-    context: ContractContext,
+fn counting_complete(
+    _context: ContractContext,
     state: ContractState,
-    zk_state: ZkState<SecretVarMetadata>,
+    _zk_state: ZkState<SecretVarMetadata>,
     output_variables: Vec<SecretVarId>,
 ) -> (ContractState, Vec<EventGroup>, Vec<ZkStateChange>) {
     (
@@ -199,24 +153,10 @@ fn sum_compute_complete(
 
 /// Automatically called when a variable is opened/declassified.
 ///
-/// We can now read the sum variable, and save it in the contract state.
-///
-/// ### Parameters:
-///
-/// * `ctx`: [`ContractContext`], the context of the current call.
-///
-/// * `state`: [`ContractState`], the current state of the contract.
-///
-/// * `zk_state`: [`ZkState<SecretVarMetadata>`], the current zk state.
-///
-/// * `opened_variables`: [`Vec<SecretVarId>`], the id's of the opened variables.
-///
-/// ### Returns
-///
-/// The new state with the computed sum, and a ZkStateChange denoting that the zk computation is done.
+/// We can now read the for and against variables, and compute the result
 #[zk_on_variables_opened]
 fn open_sum_variable(
-    context: ContractContext,
+    _context: ContractContext,
     mut state: ContractState,
     zk_state: ZkState<SecretVarMetadata>,
     opened_variables: Vec<SecretVarId>,
@@ -226,21 +166,21 @@ fn open_sum_variable(
         1,
         "Unexpected number of output variables"
     );
-    let sum = read_variable_u32_le(&zk_state, opened_variables.get(0));
-    state.sum_result = Some(sum);
+    let votes_for = read_variable_u32_le(&zk_state, opened_variables.get(0));
+    let total_votes = zk_state
+        .secret_variables
+        .iter()
+        .filter(|(_, x)| x.metadata.variable_type == SecretVarType::Vote)
+        .count();
+    let votes_against = (total_votes as u32) - votes_for;
+
+    let vote_result = determine_result(votes_for, votes_against);
+    state.vote_result = Some(vote_result);
+
     (state, vec![], vec![ZkStateChange::ContractDone])
 }
 
 /// Reads a variable's data as an u32.
-///
-/// ### Parameters:
-///
-/// * `zk_state`: [`&ZkState<SecretVarMetadata>`], the current zk state.
-///
-/// * `sum_variable_id`: [`Option<&SecretVarId>`], the id of the secret variable to be read.
-///
-/// ### Returns
-/// The value of the variable as an [`u32`].
 fn read_variable_u32_le(
     zk_state: &ZkState<SecretVarMetadata>,
     sum_variable_id: Option<&SecretVarId>,
@@ -250,4 +190,15 @@ fn read_variable_u32_le(
     let mut buffer = [0u8; 4];
     buffer.copy_from_slice(sum_variable.data.as_ref().unwrap().as_slice());
     <u32>::from_le_bytes(buffer)
+}
+
+/// Determines the result of the vote via standard majority decision on inputs the number of votes
+/// for and against.
+fn determine_result(votes_for: u32, votes_against: u32) -> VoteResult {
+    let passed = votes_against < votes_for;
+    VoteResult {
+        votes_for,
+        votes_against,
+        passed,
+    }
 }
